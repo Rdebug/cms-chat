@@ -14,6 +14,7 @@ class ExampleTest extends TestCase
     {
         $response = $this->get('/');
 
-        $response->assertStatus(200);
+        // "/" é protegido por auth no painel interno
+        $response->assertStatus(302);
     }
 }

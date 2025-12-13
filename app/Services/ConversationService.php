@@ -40,6 +40,10 @@ class ConversationService
             if ($minutesSinceLastMessage < self::REOPEN_TIMEOUT_MINUTES) {
                 $lastClosed->status = 'new';
                 $lastClosed->current_agent_id = null;
+                $lastClosed->current_sector_id = null;
+                $lastClosed->bot_state = 'idle';
+                $lastClosed->bot_last_prompt_at = null;
+                $lastClosed->bot_menu_sent_at = null;
                 $lastClosed->save();
                 return $lastClosed;
             }

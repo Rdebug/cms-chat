@@ -14,6 +14,9 @@ class Conversation extends Model
         'current_sector_id',
         'current_agent_id',
         'status',
+        'bot_state',
+        'bot_last_prompt_at',
+        'bot_menu_sent_at',
         'last_message_at',
     ];
 
@@ -21,6 +24,8 @@ class Conversation extends Model
     {
         return [
             'last_message_at' => 'datetime',
+            'bot_last_prompt_at' => 'datetime',
+            'bot_menu_sent_at' => 'datetime',
         ];
     }
 
