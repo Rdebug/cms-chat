@@ -84,15 +84,16 @@ class WebhookWhatsAppBotTest extends TestCase
 
     public function test_keyword_routes_assign_sector_and_queue(): void
     {
-        $financeiro = Sector::create(['name' => 'Financeiro', 'slug' => 'financeiro', 'menu_code' => '1', 'active' => true]);
+        $dividaAtiva = Sector::create(['name' => 'Dívida Ativa', 'slug' => 'divida_ativa', 'menu_code' => '1', 'active' => true]);
 
         $remote = '5511777777777@s.whatsapp.net';
-        $this->postJson('/webhook/whatsapp', $this->payload($remote, 'preciso de boleto'))->assertOk();
+        // Usa "parcelamento" que está nas keywords de divida_ativa mas não aciona fluxo de clarificação
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, 'preciso fazer um parcelamento'))->assertOk();
 
         $conversation = Conversation::where('whatsapp_number', '5511777777777')->firstOrFail();
         $conversation->refresh();
 
-        $this->assertEquals($financeiro->id, $conversation->current_sector_id);
+        $this->assertEquals($dividaAtiva->id, $conversation->current_sector_id);
         $this->assertEquals('queued', $conversation->status);
 
         $botMessages = Message::where('conversation_id', $conversation->id)->where('direction', 'bot')->get();
@@ -116,6 +117,109 @@ class WebhookWhatsAppBotTest extends TestCase
 
         $botMessages = Message::where('conversation_id', $conversation->id)->where('direction', 'bot')->count();
         $this->assertEquals(0, $botMessages);
+    }
+
+    public function test_clarification_flow_asks_question_on_ambiguous_word(): void
+    {
+        Sector::create(['name' => 'Dívida Ativa', 'slug' => 'divida_ativa', 'menu_code' => '1', 'active' => true]);
+        Sector::create(['name' => 'Fiscalização', 'slug' => 'fiscalizacao', 'menu_code' => '2', 'active' => true]);
+
+        $remote = '5511999888877@s.whatsapp.net';
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, 'boleto'))->assertOk();
+
+        $conversation = Conversation::where('whatsapp_number', '5511999888877')->firstOrFail();
+        $conversation->refresh();
+
+        $this->assertEquals('awaiting_clarification', $conversation->bot_state);
+        $this->assertNotNull($conversation->bot_clarification_context);
+        $this->assertArrayHasKey('options', $conversation->bot_clarification_context);
+
+        $botMessages = Message::where('conversation_id', $conversation->id)
+            ->where('direction', 'bot')
+            ->get();
+        $this->assertGreaterThanOrEqual(1, $botMessages->count());
+        $lastMessage = strtolower($botMessages->last()->body ?? '');
+        // Verifica se contém "boleto" na pergunta (a pergunta pode variar)
+        $this->assertStringContainsString('boleto', $lastMessage);
+    }
+
+    public function test_clarification_flow_processes_valid_response(): void
+    {
+        $dividaAtiva = Sector::create(['name' => 'Dívida Ativa', 'slug' => 'divida_ativa', 'menu_code' => '1', 'active' => true]);
+        Sector::create(['name' => 'Fiscalização', 'slug' => 'fiscalizacao', 'menu_code' => '2', 'active' => true]);
+
+        $remote = '5511999777766@s.whatsapp.net';
+        
+        // Primeira mensagem: "boleto" → inicia fluxo
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, 'boleto'))->assertOk();
+        
+        // Segunda mensagem: "1" → processa resposta
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, '1'))->assertOk();
+
+        $conversation = Conversation::where('whatsapp_number', '5511999777766')->firstOrFail();
+        $conversation->refresh();
+
+        $this->assertEquals($dividaAtiva->id, $conversation->current_sector_id);
+        $this->assertEquals('queued', $conversation->status);
+        $this->assertEquals('handoff', $conversation->bot_state);
+        $this->assertNull($conversation->bot_clarification_context);
+    }
+
+    public function test_clarification_flow_handles_invalid_response(): void
+    {
+        Sector::create(['name' => 'Dívida Ativa', 'slug' => 'divida_ativa', 'menu_code' => '1', 'active' => true]);
+        Sector::create(['name' => 'Fiscalização', 'slug' => 'fiscalizacao', 'menu_code' => '2', 'active' => true]);
+
+        $remote = '5511999666655@s.whatsapp.net';
+        
+        // Primeira mensagem: "boleto" → inicia fluxo
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, 'boleto'))->assertOk();
+        
+        // Segunda mensagem: "99" → resposta inválida (número fora do range)
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, '99'))->assertOk();
+
+        $conversation = Conversation::where('whatsapp_number', '5511999666655')->firstOrFail();
+        $conversation->refresh();
+
+        // Ainda aguardando clarificação (não atribuiu setor)
+        $this->assertEquals('awaiting_clarification', $conversation->bot_state);
+        $this->assertNull($conversation->current_sector_id);
+        
+        // Deve ter enviado mensagem de erro (procura em todas as mensagens do bot, não apenas a última)
+        $botMessages = Message::where('conversation_id', $conversation->id)
+            ->where('direction', 'bot')
+            ->orderBy('sent_at', 'desc')
+            ->get();
+        
+        $hasInvalidMessage = false;
+        foreach ($botMessages as $msg) {
+            if (stripos($msg->body ?? '', 'inválida') !== false || stripos($msg->body ?? '', 'opção inválida') !== false) {
+                $hasInvalidMessage = true;
+                break;
+            }
+        }
+        $this->assertTrue($hasInvalidMessage, 'Bot should send invalid option message');
+    }
+
+    public function test_menu_command_cancels_clarification_flow(): void
+    {
+        Sector::create(['name' => 'Dívida Ativa', 'slug' => 'divida_ativa', 'menu_code' => '1', 'active' => true]);
+        Sector::create(['name' => 'Fiscalização', 'slug' => 'fiscalizacao', 'menu_code' => '2', 'active' => true]);
+
+        $remote = '5511999555544@s.whatsapp.net';
+        
+        // Primeira mensagem: "boleto" → inicia fluxo
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, 'boleto'))->assertOk();
+        
+        // Segunda mensagem: "menu" → cancela fluxo
+        $this->postJson('/webhook/whatsapp', $this->payload($remote, 'menu'))->assertOk();
+
+        $conversation = Conversation::where('whatsapp_number', '5511999555544')->firstOrFail();
+        $conversation->refresh();
+
+        // Deve ter voltado ao estado normal (não mais aguardando clarificação)
+        $this->assertNotEquals('awaiting_clarification', $conversation->bot_state);
+        $this->assertNull($conversation->bot_clarification_context);
     }
 }
 

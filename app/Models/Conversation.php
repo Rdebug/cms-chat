@@ -17,6 +17,7 @@ class Conversation extends Model
         'bot_state',
         'bot_last_prompt_at',
         'bot_menu_sent_at',
+        'bot_clarification_context',
         'last_message_at',
     ];
 
@@ -26,6 +27,7 @@ class Conversation extends Model
             'last_message_at' => 'datetime',
             'bot_last_prompt_at' => 'datetime',
             'bot_menu_sent_at' => 'datetime',
+            'bot_clarification_context' => 'array',
         ];
     }
 

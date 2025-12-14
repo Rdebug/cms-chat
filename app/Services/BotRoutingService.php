@@ -30,8 +30,9 @@ class BotRoutingService
 
         $text = $this->normalizeText($messageText ?? '');
 
-        // Comandos de menu/reset
+        // Comandos de menu/reset (cancela qualquer fluxo de clarificação)
         if ($text !== '' && $this->isAnyCommand($text, (array) config('bot.menu_commands', []))) {
+            $conversation->bot_clarification_context = null;
             $this->resetToTriage($conversation);
             $this->sendInitialMenuAndMark($conversation);
             return;
@@ -52,16 +53,39 @@ class BotRoutingService
 
         // Se ainda não tem setor, manda o menu apenas na 1ª mensagem e depois trabalha com texto/keywords
         if ($conversation->current_sector_id === null) {
+            // Se está aguardando clarificação, processa resposta (numérica ou não)
+            if ($conversation->bot_state === 'awaiting_clarification') {
+                // Se for número, processa como resposta de clarificação
+                if ($this->isMenuSelection($text)) {
+                    if ($this->processClarificationResponse($conversation, $text)) {
+                        return;
+                    }
+                } else {
+                    // Se não for número mas está aguardando clarificação, tenta processar como resposta inválida
+                    if ($this->processClarificationResponse($conversation, $text)) {
+                        return;
+                    }
+                }
+            }
+
             // Primeira mensagem: envia menu 1x por conversa
             if ($this->needsInitialMenu($conversation) && !$this->hasSentMenu($conversation)) {
                 $this->sendInitialMenuAndMark($conversation);
             }
 
-            // Se for número, tenta processar como menu
+            // Se for número, tenta processar como menu (já processou clarificação acima se necessário)
             if ($this->isMenuSelection($text)) {
+                // Processa como seleção de menu normal
                 if ($this->processMenuSelection($conversation, $text)) {
                     $this->markBotState($conversation, 'handoff');
                 }
+                return;
+            }
+
+            // Verifica se há fluxo de desambiguação configurado para esta palavra
+            $clarificationFlow = $this->findClarificationFlow($text);
+            if ($clarificationFlow) {
+                $this->startClarificationFlow($conversation, $clarificationFlow, $text);
                 return;
             }
 
@@ -392,6 +416,173 @@ class BotRoutingService
         }
 
         return false;
+    }
+
+    /**
+     * Encontra fluxo de desambiguação configurado para uma palavra
+     */
+    private function findClarificationFlow(string $normalizedText): ?array
+    {
+        if ($normalizedText === '') {
+            return null;
+        }
+
+        $flows = (array) config('bot.clarification_flows', []);
+        foreach ($flows as $keyword => $flow) {
+            $keyword = $this->normalizeText((string) $keyword);
+            if ($keyword !== '' && mb_stripos($normalizedText, $keyword) !== false) {
+                if (isset($flow['question']) && isset($flow['options']) && is_array($flow['options'])) {
+                    return $flow;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Inicia fluxo de desambiguação
+     */
+    private function startClarificationFlow(Conversation $conversation, array $flow, string $triggerWord): void
+    {
+        $options = [];
+        $message = ($flow['question'] ?? 'Escolha uma opção:') . "\n\n";
+        
+        // Primeiro, filtra opções válidas
+        $validOptions = [];
+        foreach ($flow['options'] ?? [] as $option) {
+            $sectorSlug = $option['sector_slug'] ?? null;
+            if (!$sectorSlug) {
+                continue;
+            }
+
+            // Valida se setor existe e está ativo
+            $sector = Sector::where('active', true)->where('slug', $sectorSlug)->first();
+            if (!$sector) {
+                continue;
+            }
+
+            $validOptions[] = [
+                'sector_slug' => $sectorSlug,
+                'sector_id' => $sector->id,
+                'label' => $option['label'] ?? 'Opção',
+            ];
+        }
+
+        // Agora numera as opções válidas sequencialmente (1, 2, 3, ...)
+        foreach ($validOptions as $index => $option) {
+            $num = $index + 1;
+            
+            $options[] = [
+                'number' => $num,
+                'sector_slug' => $option['sector_slug'],
+                'sector_id' => $option['sector_id'],
+                'label' => $option['label'],
+            ];
+
+            $message .= "{$num}) {$option['label']}\n";
+        }
+
+        if (empty($options)) {
+            // Se nenhuma opção válida, não inicia fluxo
+            return;
+        }
+
+        $message .= "\nDigite o número da opção desejada.";
+
+        // Salva contexto
+        $conversation->bot_clarification_context = [
+            'trigger_word' => $triggerWord,
+            'options' => $options,
+            'asked_at' => now()->toIso8601String(),
+            'attempts' => 0,
+        ];
+        $conversation->bot_state = 'awaiting_clarification';
+        $conversation->bot_last_prompt_at = now();
+        $conversation->save();
+
+        $this->sendBotText($conversation, $message, meta: ['kind' => 'clarification_flow', 'trigger' => $triggerWord]);
+    }
+
+    /**
+     * Processa resposta durante fluxo de desambiguação
+     */
+    private function processClarificationResponse(Conversation $conversation, string $text): bool
+    {
+        $context = $conversation->bot_clarification_context;
+        if (!is_array($context) || empty($context['options'])) {
+            // Contexto inválido, limpa e volta ao estado normal
+            $conversation->bot_clarification_context = null;
+            $conversation->bot_state = 'idle';
+            $conversation->save();
+            return false;
+        }
+
+        $selectedNum = (int) trim($text);
+        $options = $context['options'] ?? [];
+        
+        // Incrementa tentativas
+        $context['attempts'] = ($context['attempts'] ?? 0) + 1;
+        $conversation->bot_clarification_context = $context;
+        $conversation->save();
+
+        // Busca opção pelo número
+        $selectedOption = null;
+        foreach ($options as $option) {
+            if (isset($option['number']) && (int) $option['number'] === $selectedNum) {
+                $selectedOption = $option;
+                break;
+            }
+        }
+
+        if (!$selectedOption || !isset($selectedOption['sector_id'])) {
+            // Resposta inválida
+            $maxAttempts = 3;
+            if ($context['attempts'] >= $maxAttempts) {
+                // Muitas tentativas, cancela fluxo e volta ao menu
+                $conversation->bot_clarification_context = null;
+                $conversation->bot_state = 'idle';
+                $conversation->save();
+                $this->sendBotText(
+                    $conversation,
+                    "Não consegui entender sua escolha. Digite *menu* para ver todas as opções novamente.",
+                    meta: ['kind' => 'clarification_max_attempts']
+                );
+                return true;
+            }
+
+            // Pede novamente
+            $this->sendBotText(
+                $conversation,
+                "❌ Opção inválida. Por favor, digite apenas o número da opção desejada.",
+                meta: ['kind' => 'clarification_invalid']
+            );
+            return true;
+        }
+
+        // Resposta válida: atribui setor
+        $sector = Sector::find($selectedOption['sector_id']);
+        if (!$sector) {
+            $conversation->bot_clarification_context = null;
+            $conversation->bot_state = 'idle';
+            $conversation->save();
+            return false;
+        }
+
+        $this->conversationService->assignSector($conversation, $sector);
+        
+        // Limpa contexto
+        $conversation->bot_clarification_context = null;
+        $conversation->bot_state = 'handoff';
+        $conversation->save();
+
+        $this->sendBotText(
+            $conversation,
+            "Perfeito! Vou te direcionar para o setor *{$sector->name}*. Aguarde, em breve um atendente entrará em contato.",
+            meta: ['kind' => 'clarification_success', 'sector_id' => $sector->id, 'trigger' => $context['trigger_word'] ?? null]
+        );
+
+        return true;
     }
 
     private function sendBotText(Conversation $conversation, string $text, array $meta = []): void

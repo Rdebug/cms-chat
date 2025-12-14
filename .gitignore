@@ -22,3 +22,6 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Guia de deploy (não deve subir no repositório)
+GUIA_DEPLOY_AWS.md
