@@ -151,3 +151,5 @@ const applyFilters = () => {
     </AuthenticatedLayout>
 </template>
 
+
+
